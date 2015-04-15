@@ -354,7 +354,7 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 
 - (NSURL*)_requestForHeartbeat
 {
-    NSString* path = [NSString stringWithFormat:@"%@/time/0%@", [self _pubNubPath], [self _standardQueryParams]];
+    NSString* path = [NSString stringWithFormat:@"%@/subscribe/%@/%@/0/0%@", [self _pubNubPath], _subscriberKey, _channelId, [self _standardQueryParams]];
     return [NSURL URLWithString:path];
 }
 
