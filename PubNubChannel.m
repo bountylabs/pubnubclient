@@ -286,7 +286,7 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
     dispatch_async(_heartbeatQueue, ^{
         dispatch_suspend(_heartbeatQueue);
         __strong typeof(self) strongSelf = weakSelf;
-        [strongSelf _issueRequestWithUrl:[strongSelf _requestForSubscribe] polling:NO completion:^(NSObject* object, NSError* error) {
+        [strongSelf _issueRequestWithUrl:[strongSelf _requestForHeartbeat] polling:NO completion:^(NSObject* object, NSError* error) {
             __strong typeof(self) innerStrongSelf = weakSelf;
             if (innerStrongSelf && connectCountOnDispatch == innerStrongSelf->_connectCount) {
                 [innerStrongSelf _processHeartbeatResponse:object error:error];
