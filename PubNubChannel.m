@@ -13,10 +13,10 @@ static NSString* kPubNubProtocol = @"https";
 static NSString* kPubNubHost = @"pubsub.pubnub.com";
 static NSString* kPubNubSdkId = @"Periscope";
 static const NSTimeInterval kPubNubPollTimeoutSeconds = 20.0;
-static const NSTimeInterval kPubNubTimeoutSeconds = 6.0;
+static const NSTimeInterval kPubNubTimeoutSeconds = 5.0;
 static const NSTimeInterval kPubNubPollFailureBackoffSeconds = 1.0;
-static const NSInteger kPubNubHeartbeatFailureThreshold = 3;
-static const NSTimeInterval kPubNubHeartbeatInterval = 10.0;
+static const NSInteger kPubNubHeartbeatFailureThreshold = 2;
+static const NSTimeInterval kPubNubHeartbeatInterval = 5.0;
 static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 
 @implementation PubNubChannel
@@ -263,11 +263,16 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
     if (error) {
         _heartbeatFailureCount++;
         if (_heartbeatFailureCount >= kPubNubHeartbeatFailureThreshold) {
-            // Too many consecutive failures, notify delegate and reset since for future requests.
             _sinceTime = 0;
+            [self _resetPollingSession];
+            // Too many consecutive failures, notify delegate and reset since for future requests.
             [self _dispatchChangeState:PubNubChannelStateTransientFailure];
         }
     } else {
+        if (_heartbeatFailureCount >= kPubNubHeartbeatFailureThreshold) {
+            // We were failing, now we're not, so reset the polling session in case it's still stuck in a long timeout.
+            [self _resetPollingSession];
+        }
         _heartbeatFailureCount = 0;
         [self _dispatchChangeState:PubNubChannelStateConnected];
     }
@@ -403,17 +408,22 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
     }];
 }
 
-- (void)_reachabilityStatusChanged:(AFNetworkReachabilityStatus)status
+- (void)_resetPollingSession
 {
     dispatch_barrier_async(_connectQueue, ^{
         if (_connected) {
-            if (_prevReachabilityStatus != AFNetworkReachabilityStatusUnknown) {
-                [_pollingSession invalidateAndCancel];
-                _pollingSession = [[self class] _createPollingSession];
-            }
-            _prevReachabilityStatus = status;
+            [_pollingSession invalidateAndCancel];
+            _pollingSession = [[self class] _createPollingSession];
         }
     });
+}
+
+- (void)_reachabilityStatusChanged:(AFNetworkReachabilityStatus)status
+{
+    if (_prevReachabilityStatus != AFNetworkReachabilityStatusUnknown) {
+        [self _resetPollingSession];
+    }
+    _prevReachabilityStatus = status;
 }
 
 + (NSURLSession*)_createSession
