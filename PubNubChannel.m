@@ -8,6 +8,7 @@
 
 #import "PubNubChannel.h"
 #import <AFNetworkReachabilityManager.h>
+#import <libkern/OSAtomic.h>
 
 static NSString* kPubNubProtocol = @"https";
 static NSString* kPubNubHost = @"pubsub.pubnub.com";
@@ -38,7 +39,7 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
     NSString* _encodedUserInfo;
     NSInteger _connectCount;
     AFNetworkReachabilityStatus _prevReachabilityStatus;
-    BOOL _connected;
+    volatile uint32_t _connectedInternal;
     BOOL _heartbeat;
 }
 
@@ -62,11 +63,28 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
     return self;
 }
 
+- (void)dealloc
+{
+    [[self class] _releaseQueue:_immediateQueue];
+    _immediateQueue = nil;
+    [[self class] _releaseQueue:_pollingQueue];
+    _pollingQueue = nil;
+    [[self class] _releaseQueue:_connectQueue];
+    _connectQueue = nil;
+    [[self class] _releaseQueue:_heartbeatQueue];
+    _heartbeatQueue = nil;
+}
+
++ (void)_releaseQueue:(dispatch_queue_t)queue {
+    dispatch_barrier_async(queue, ^{
+    });
+}
+
 - (void)subscribeWithUserInfo:(NSDictionary *)userInfo completion:(void (^)())completion
 {
     dispatch_barrier_async(_connectQueue, ^{
-        if (!_connected) {
-            _connected = YES;
+        if (!self.connected) {
+            self.connected = YES;
             _encodedUserInfo = [[self class] _encodeJsonData:@{ _channelId: userInfo }];
             _sinceTime = 0;
             _heartbeatFailureCount = 0;
@@ -74,12 +92,6 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 
             _session = [[self class] _createSession];
             _pollingSession = [[self class] _createPollingSession];
-
-            [self _dispatchSubscribePoll];
-
-            if (_heartbeat) {
-                [self _dispatchHeartbeat];
-            }
 
             if (_heartbeat) {
                 _prevReachabilityStatus = AFNetworkReachabilityStatusUnknown;
@@ -94,6 +106,10 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 
             [self _dispatchChangeState:PubNubChannelStateConnected];
             dispatch_async(dispatch_get_main_queue(), ^{
+                [self _dispatchSubscribePoll];
+                if (_heartbeat) {
+                    [self _dispatchHeartbeat];
+                }
                 completion();
             });
         }
@@ -103,8 +119,8 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 - (void)unsubscribeWithCompletion:(void (^)())completion
 {
     dispatch_barrier_async(_connectQueue, ^{
-        if (_connected) {
-            _connected = NO;
+        if (self.connected) {
+            self.connected = NO;
             [_session invalidateAndCancel];
             _session = nil;
             [_pollingSession invalidateAndCancel];
@@ -124,55 +140,61 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 
 - (void)publishMessage:(NSDictionary*)message
 {
-    dispatch_async(_immediateQueue, ^{
-        NSString* encodedMsg = [[self class] _encodeJsonData:message];
-        if (encodedMsg) {
-            [self _issueRequestWithUrl:[self _requestForPublishWithEncodedMessage:encodedMsg] polling:NO arrayCompletion:^(NSArray* array, NSError* error) {
-            }];
-        }
-    });
+    if (self.connected) {
+        dispatch_async(_immediateQueue, ^{
+            NSString* encodedMsg = [[self class] _encodeJsonData:message];
+            if (encodedMsg) {
+                [self _issueRequestWithUrl:[self _requestForPublishWithEncodedMessage:encodedMsg] polling:NO arrayCompletion:^(NSArray* array, NSError* error) {
+                }];
+            }
+        });
+    }
 }
 
 - (void)hereNowWithCompletion:(void (^)(NSArray* users))completion
 {
-    dispatch_async(_immediateQueue, ^{
-        dispatch_suspend(_immediateQueue);
-        [self _issueRequestWithUrl:[self _requestForHereNow] polling:NO dictionaryCompletion:^(NSDictionary* dict, NSError* error) {
-            dispatch_resume(_immediateQueue);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if ([dict[@"uuids"] isKindOfClass:[NSArray class]]) {
-                    completion((NSArray*)dict[@"uuids"]);
-                } else {
-                    completion(nil);
-                }
-            });
-        }];
-    });
+    if (self.connected) {
+        dispatch_async(_immediateQueue, ^{
+            dispatch_suspend(_immediateQueue);
+            [self _issueRequestWithUrl:[self _requestForHereNow] polling:NO dictionaryCompletion:^(NSDictionary* dict, NSError* error) {
+                dispatch_resume(_immediateQueue);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if ([dict[@"uuids"] isKindOfClass:[NSArray class]]) {
+                        completion((NSArray*)dict[@"uuids"]);
+                    } else {
+                        completion(nil);
+                    }
+                });
+            }];
+        });
+    }
 }
 
 - (void)historyWithStartTime:(long long)startTime endTime:(long long)endTime limit:(NSInteger)limit completion:(void (^)(long long start, long long end, NSArray* messages))completion
 {
-    dispatch_async(_immediateQueue, ^{
-        dispatch_suspend(_immediateQueue);
-        [self _issueRequestWithUrl:[self _requestForHistoryWithStartTime:startTime endTime:endTime limit:limit] polling:NO arrayCompletion:^(NSArray* array, NSError* error) {
-            dispatch_resume(_immediateQueue);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSArray* messages = nil;
-                if ([array[0] isKindOfClass:[NSArray class]]) {
-                    messages = array[0];
-                }
-                long long resultStart = 0;
-                if ([array[1] isKindOfClass:[NSNumber class]] || [array[1] isKindOfClass:[NSString class]]) {
-                    resultStart = [array[1] longLongValue];
-                }
-                long long resultEnd = 0;
-                if ([array[2] isKindOfClass:[NSNumber class]] || [array[2] isKindOfClass:[NSString class]]) {
-                    resultEnd = [array[2] longLongValue];
-                }
-                completion(resultStart, resultEnd, messages);
-            });
-        }];
-    });
+    if (self.connected) {
+        dispatch_async(_immediateQueue, ^{
+            dispatch_suspend(_immediateQueue);
+            [self _issueRequestWithUrl:[self _requestForHistoryWithStartTime:startTime endTime:endTime limit:limit] polling:NO arrayCompletion:^(NSArray* array, NSError* error) {
+                dispatch_resume(_immediateQueue);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSArray* messages = nil;
+                    if ([array[0] isKindOfClass:[NSArray class]]) {
+                        messages = array[0];
+                    }
+                    long long resultStart = 0;
+                    if ([array[1] isKindOfClass:[NSNumber class]] || [array[1] isKindOfClass:[NSString class]]) {
+                        resultStart = [array[1] longLongValue];
+                    }
+                    long long resultEnd = 0;
+                    if ([array[2] isKindOfClass:[NSNumber class]] || [array[2] isKindOfClass:[NSString class]]) {
+                        resultEnd = [array[2] longLongValue];
+                    }
+                    completion(resultStart, resultEnd, messages);
+                });
+            }];
+        });
+    }
 }
 
 - (void)_leaveWithCompletion:(void (^)())completion
@@ -223,9 +245,7 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(pollSeconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong typeof(self) strongSelf = weakSelf;
-        [strongSelf _dispatchIfConnectedSync:^{
-            [strongSelf _dispatchSubscribePoll];
-        }];
+        [strongSelf _dispatchSubscribePoll];
     });
 }
 
@@ -233,29 +253,27 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.delegate) {
-            [self _dispatchIfConnectedSync:^{
+            if (self.connected) {
                 [self.delegate pubNubChannel:self messages:messages receivedDate:receivedData];
-            }];
+            }
         }
     });
 }
 
 - (void)_dispatchSubscribePoll
 {
-    NSInteger connectCountOnDispatch = _connectCount;
-    dispatch_queue_t queue = _pollingQueue;
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(queue, ^{
-        dispatch_suspend(queue);
-        __strong typeof(self) strongSelf = weakSelf;
-        [strongSelf _issueRequestWithUrl:[strongSelf _requestForSubscribe] polling:YES arrayCompletion:^(NSArray* array, NSError* error) {
-            __strong typeof(self) innerStrongSelf = weakSelf;
-            if (innerStrongSelf && connectCountOnDispatch == innerStrongSelf->_connectCount) {
-                [innerStrongSelf _processSubscribePollResponseWithArray:array error:error];
-            }
-            dispatch_resume(queue);
-        }];
-    });
+    if (self.connected) {
+        NSInteger connectCountOnDispatch = _connectCount;
+        dispatch_async(_pollingQueue, ^{
+            dispatch_suspend(_pollingQueue);
+            [self _issueRequestWithUrl:[self _requestForSubscribe] polling:YES arrayCompletion:^(NSArray* array, NSError* error) {
+                if (connectCountOnDispatch == self->_connectCount) {
+                    [self _processSubscribePollResponseWithArray:array error:error];
+                }
+                dispatch_resume(_pollingQueue);
+            }];
+        });
+    }
 }
 
 - (void)_processHeartbeatResponse:(NSObject*)object error:(NSError*)error
@@ -286,29 +304,29 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 
 - (void)_dispatchHeartbeat
 {
-     NSInteger connectCountOnDispatch = _connectCount;
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(_heartbeatQueue, ^{
-        dispatch_suspend(_heartbeatQueue);
-        __strong typeof(self) strongSelf = weakSelf;
-        [strongSelf _issueRequestWithUrl:[strongSelf _requestForHeartbeat] polling:NO completion:^(NSObject* object, NSError* error) {
-            __strong typeof(self) innerStrongSelf = weakSelf;
-            if (innerStrongSelf && connectCountOnDispatch == innerStrongSelf->_connectCount) {
-                [innerStrongSelf _processHeartbeatResponse:object error:error];
-            }
-            dispatch_resume(_heartbeatQueue);
-        }];
-    });
+    if (self.connected) {
+        NSInteger connectCountOnDispatch = _connectCount;
+        dispatch_async(_heartbeatQueue, ^{
+            dispatch_suspend(_heartbeatQueue);
+            [self _issueRequestWithUrl:[self _requestForHeartbeat] polling:NO completion:^(NSObject* object, NSError* error) {
+                if (connectCountOnDispatch == self->_connectCount) {
+                    [self _processHeartbeatResponse:object error:error];
+                }
+                dispatch_resume(_heartbeatQueue);
+            }];
+        });
+    }
 }
 
-- (void)_dispatchIfConnectedSync:(void (^)())completion
-{
-    __block BOOL connected = NO;
-    dispatch_sync(_connectQueue, ^{
-        connected = _connected;
-    });
+- (BOOL)connected {
+    return _connectedInternal != 0;
+}
+
+- (void)setConnected:(BOOL)connected {
     if (connected) {
-        completion();
+        OSAtomicOr32Barrier(1, &_connectedInternal);
+    } else {
+        OSAtomicAnd32Barrier(0, &_connectedInternal);
     }
 }
 
@@ -366,12 +384,15 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 - (void)_issueRequestWithUrl:(NSURL*)url polling:(BOOL)polling completion:(void (^)(NSObject* jsonObject, NSError* error))completion
 {
     __block NSURLSession* session = nil;
-    [self _dispatchIfConnectedSync:^{
+    dispatch_sync(_connectQueue, ^{
         session = polling ? _pollingSession : _session;
-    }];
-    if (session != nil) {
-        [[self class] _issueRequestWithSession:session url:url completion:completion];
-    } else {
+        if (session != nil) {
+            // Issue the request (create and start the NSURLSessionDataTask) inside protected connect queue,
+            // so we're always issuing the request on a fully valid session.
+            [[self class] _issueRequestWithSession:session url:url completion:completion];
+        }
+    });
+    if (session == nil) {
         completion(nil, nil);
     }
 }
@@ -411,7 +432,7 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
 - (void)_resetPollingSession
 {
     dispatch_barrier_async(_connectQueue, ^{
-        if (_connected) {
+        if (self.connected) {
             [_pollingSession invalidateAndCancel];
             _pollingSession = [[self class] _createPollingSession];
         }
@@ -450,7 +471,6 @@ static const NSTimeInterval kPubNubHeartbeatIntervalFail = 1.0;
     NSError* error;
     NSData* data = [NSJSONSerialization dataWithJSONObject:object options:0 error:&error];
     if (error) {
-        NSLog(@"error encoding json %@", error);
         return nil;
     }
     NSString* encodedStr = [[self class] _urlEncode:[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]];
